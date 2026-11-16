@@ -60,7 +60,7 @@ class EventValuesHelperTest(shared_test_lib.BaseTestCase):
             event_data, event_data_stream
         )
 
-        self.assertEqual(content_identifier, "31aac7b1f8c1446f4b638c0dc5f92981")
+        self.assertEqual(content_identifier, "63bdea5b429e623c20bc725dbaf755ae")
 
 
 class EventDataTest(shared_test_lib.BaseTestCase):

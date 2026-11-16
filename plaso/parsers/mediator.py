@@ -521,14 +521,15 @@ class ParserMediator:
                 events.CalculateEventDataStreamHashAttributes(self._event_data_stream)
             )
 
+        setattr(event_data, "_corrupted", corrupted)
+        setattr(event_data, "_recovered", recovered)
+
         event_values_hash = events.CalculateEventValuesHash(
             event_data,
             self._event_data_stream,
             event_data_stream_attributes=self._event_data_stream_hash_attributes,
         )
-        setattr(event_data, "_corrupted", corrupted)
         setattr(event_data, "_event_values_hash", event_values_hash)
-        setattr(event_data, "_recovered", recovered)
 
         self._storage_writer.AddAttributeContainer(event_data)
         self._number_of_event_data += 1

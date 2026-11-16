@@ -1,7 +1,12 @@
 """The output and formatting multi-processing engine."""
 
 import heapq
+import json
 import os
+import shutil
+import tempfile
+
+from acstore.containers import interface as containers_interface
 
 from plaso.containers import events
 from plaso.engine import processing_status
@@ -134,6 +139,8 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
         self._export_event_heap = PsortEventHeap()
         self._export_event_timestamp = 0
         self._number_of_consumed_events = 0
+        self._spool_directory = None
+        self._sorted_event_runs = []
         self._output_mediator = None
         self._processing_configuration = None
         self._status = definitions.STATUS_INDICATOR_IDLE
@@ -249,10 +256,7 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
           resolve_event_tag (Optional[bool]): True if the event tag should be
               resolved when the export buffer is flushed.
         """
-        if (
-            event.timestamp != self._export_event_timestamp
-            or self._export_event_heap.number_of_events > self._HEAP_MAXIMUM_EVENTS
-        ):
+        if event.timestamp != self._export_event_timestamp:
             self._FlushExportBuffer(
                 storage_reader,
                 output_module,
@@ -260,6 +264,9 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
                 resolve_event_tag=resolve_event_tag,
             )
             self._export_event_timestamp = event.timestamp
+
+        elif self._export_event_heap.number_of_events > self._HEAP_MAXIMUM_EVENTS:
+            self._SpoolExportBuffer()
 
         self._export_event_heap.PushEvent(
             event, event_data, event_data_stream, event_tag=event_tag
@@ -297,6 +304,7 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
         resolve_event_tag = event_filter is None
 
         self._event_tags = None
+        self._ResetSpool()
 
         time_slice_buffer = None
         time_slice_range = None
@@ -429,7 +437,10 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
                     break
 
         self._FlushExportBuffer(
-            storage_reader, output_module, resolve_event_tag=resolve_event_tag
+            storage_reader,
+            output_module,
+            deduplicate_events=deduplicate_events,
+            resolve_event_tag=resolve_event_tag,
         )
 
     def _FlushExportBuffer(
@@ -450,6 +461,50 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
               resolved, which is the case if it was not resolved before the
               event filter was applied.
         """
+        if self._sorted_event_runs:
+            # The events of a single timestamp did not fit in the export buffer
+            # and were spooled to disk in sorted runs. Spool the remaining
+            # events in the heap and merge the sorted runs, so that duplicate
+            # detection and MACB grouping are not affected by the buffer size.
+            self._SpoolExportBuffer()
+            event_stream = self._MergeSortedRuns(storage_reader, resolve_event_tag)
+        else:
+            event_stream = self._export_event_heap.PopEvents()
+
+        try:
+            self._WriteEvents(
+                event_stream,
+                storage_reader,
+                output_module,
+                deduplicate_events=deduplicate_events,
+                resolve_event_tag=resolve_event_tag,
+            )
+
+        finally:
+            if self._sorted_event_runs:
+                self._ResetSpool()
+
+    def _WriteEvents(
+        self,
+        event_stream,
+        storage_reader,
+        output_module,
+        deduplicate_events=True,
+        resolve_event_tag=True,
+    ):
+        """Writes sorted events to the output module.
+
+        Args:
+          event_stream (generator[tuple]): sorted events, each event as a tuple
+              of event values hash, event, event data, event data stream and
+              event tag.
+          storage_reader (StorageReader): storage reader.
+          output_module (OutputModule): output module.
+          deduplicate_events (Optional[bool]): True if events should be
+              deduplicated.
+          resolve_event_tag (Optional[bool]): True if the event tag should be
+              resolved.
+        """
         last_event_values_hash = None
         last_macb_group_identifier = None
         last_timestamp_desc = None
@@ -461,7 +516,7 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
             event_data,
             event_data_stream,
             event_tag,
-        ) in self._export_event_heap.PopEvents():
+        ) in event_stream:
             timestamp_desc = event.timestamp_desc
 
             if (
@@ -522,6 +577,140 @@ class OutputAndFormattingMultiProcessEngine(engine.MultiProcessEngine):
 
         if macb_group:
             output_module.WriteFieldValuesOfMACBGroup(self._output_mediator, macb_group)
+
+    def _GetSpoolDirectory(self):
+        """Retrieves the spool directory used for sorted event runs.
+
+        The directory is created lazily, when the first event run is spooled.
+
+        Returns:
+          str: path of the spool directory.
+        """
+        if self._spool_directory is None:
+            self._spool_directory = tempfile.mkdtemp(prefix="psort_")
+
+        return self._spool_directory
+
+    def _MergeSortedRuns(self, storage_reader, resolve_event_tag):
+        """Merges the spooled sorted event runs.
+
+        Args:
+          storage_reader (StorageReader): storage reader.
+          resolve_event_tag (bool): True if the event tag should be resolved
+              when the event stream is written.
+
+        Yields:
+          tuple: containing:
+
+            str: identifier of the event content.
+            EventObject: event.
+            EventData: event data.
+            EventDataStream: event data stream.
+            EventTag: event tag or None if not resolved.
+        """
+        run_streams = [
+            self._ReadSortedRun(run_file_path)
+            for run_file_path in self._sorted_event_runs
+        ]
+
+        for event_values_hash, _, event_identifier_string in heapq.merge(*run_streams):
+            event, event_data, event_data_stream = self._ReadEventTuple(
+                storage_reader, event_identifier_string
+            )
+
+            event_tag = None
+            if not resolve_event_tag:
+                event_tag = self._GetEventTag(storage_reader, event)
+
+            yield event_values_hash, event, event_data, event_data_stream, event_tag
+
+    def _ReadEventTuple(self, storage_reader, event_identifier_string):
+        """Reads an event and its related event data and data stream.
+
+        Args:
+          storage_reader (StorageReader): storage reader.
+          event_identifier_string (str): string representation of the event
+              identifier.
+
+        Returns:
+          tuple[EventObject, EventData, EventDataStream]: event, event data and
+              event data stream.
+        """
+        event_identifier = containers_interface.AttributeContainerIdentifier()
+        event_identifier.CopyFromString(event_identifier_string)
+
+        event = storage_reader.GetAttributeContainerByIdentifier(
+            events.EventObject.CONTAINER_TYPE, event_identifier
+        )
+
+        event_data_identifier = event.GetEventDataIdentifier()
+        event_data = storage_reader.GetAttributeContainerByIdentifier(
+            events.EventData.CONTAINER_TYPE, event_data_identifier
+        )
+
+        event_data_stream_identifier = event_data.GetEventDataStreamIdentifier()
+        if event_data_stream_identifier:
+            event_data_stream = storage_reader.GetAttributeContainerByIdentifier(
+                events.EventDataStream.CONTAINER_TYPE, event_data_stream_identifier
+            )
+        else:
+            event_data_stream = None
+
+        return event, event_data, event_data_stream
+
+    def _ReadSortedRun(self, run_file_path):
+        """Reads a spooled sorted event run.
+
+        Args:
+          run_file_path (str): path of the run file.
+
+        Yields:
+          list[str]: sort key of the event, consisting of the event values
+              hash, timestamp description and event identifier.
+        """
+        with open(run_file_path, "r", encoding="utf-8") as file_object:
+            for line in file_object:
+                yield json.loads(line)
+
+    def _ResetSpool(self):
+        """Resets the spooled sorted event runs."""
+        self._sorted_event_runs = []
+        if self._spool_directory is not None:
+            shutil.rmtree(self._spool_directory, ignore_errors=True)
+            self._spool_directory = None
+
+    def _SpoolExportBuffer(self):
+        """Spools the events in the export buffer to a sorted event run."""
+        if not self._export_event_heap.number_of_events:
+            return
+
+        run_file_path = os.path.join(
+            self._GetSpoolDirectory(), f"run_{len(self._sorted_event_runs):d}"
+        )
+
+        with open(run_file_path, "w", encoding="utf-8") as file_object:
+            for (
+                event_values_hash,
+                event,
+                _,
+                _,
+                _,
+            ) in self._export_event_heap.PopEvents():
+                timestamp_desc = event.timestamp_desc
+                if timestamp_desc is None:
+                    timestamp_desc = definitions.TIME_DESCRIPTION_UNKNOWN
+
+                event_identifier = event.GetIdentifier()
+                event_identifier_string = event_identifier.CopyToString()
+
+                sort_key = [
+                    event_values_hash,
+                    timestamp_desc,
+                    event_identifier_string,
+                ]
+                file_object.write(f"{json.dumps(sort_key):s}\n")
+
+        self._sorted_event_runs.append(run_file_path)
 
     def _GetEventTag(self, storage_reader, event):
         """Retrieves the event tag of an event.
