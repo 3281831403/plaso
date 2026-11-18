@@ -50,7 +50,7 @@ class SQLitePluginTestCase(test_lib.ParserTestCase):
         return file_entry, database
 
     def _ParseDatabaseFileWithPlugin(
-        self, path_segments, plugin, wal_path_segments=None
+        self, path_segments, plugin, wal_path_segments=None, cache=None
     ):
         """Parses a file as a SQLite database with a specific plugin.
 
@@ -63,6 +63,9 @@ class SQLitePluginTestCase(test_lib.ParserTestCase):
           plugin (SQLitePlugin): SQLite database plugin.
           wal_path_segments (list[str]): path segments inside the test data
               directory of the SQLite WAL file.
+          cache (Optional[SQLiteCache]): SQLite cache, where a cache with a
+              shared row cache can be provided to test deduplication across
+              multiple parse passes. If None a new cache is created.
 
         Returns:
           FakeStorageWriter: storage writer.
@@ -96,7 +99,8 @@ class SQLitePluginTestCase(test_lib.ParserTestCase):
         self.assertTrue(required_tables_and_column_exist)
 
         try:
-            cache = sqlite.SQLiteCache()
+            if cache is None:
+                cache = sqlite.SQLiteCache()
 
             plugin.UpdateChainAndProcess(
                 parser_mediator, cache=cache, database=database

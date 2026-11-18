@@ -181,6 +181,46 @@ class SQLiteDatabaseTest(test_lib.ParserTestCase):
         self.assertEqual(expected_results, row_results)
 
 
+class SQLiteCacheTest(test_lib.ParserTestCase):
+    """Tests for the SQLite cache."""
+
+    def testRowCacheIsolatedByDefault(self):
+        """Tests that separate caches keep separate row caches by default."""
+        cache = sqlite.SQLiteCache()
+        other_cache = sqlite.SQLiteCache()
+
+        row_cache = cache.GetRowCache("SELECT 1")
+        other_row_cache = other_cache.GetRowCache("SELECT 1")
+
+        self.assertIsNot(row_cache, other_row_cache)
+
+    def testRowCacheSharedAcrossInstances(self):
+        """Tests that a shared row cache survives even when initially empty."""
+        # An empty dictionary is falsy, so the cache must not replace it with a
+        # new instance, otherwise the two parse passes cannot deduplicate rows.
+        row_caches = {}
+        cache = sqlite.SQLiteCache(row_caches=row_caches)
+        other_cache = sqlite.SQLiteCache(row_caches=row_caches)
+
+        row_cache = cache.GetRowCache("SELECT 1")
+        row_cache.add(("value",))
+
+        other_row_cache = other_cache.GetRowCache("SELECT 1")
+        self.assertIs(other_row_cache, row_cache)
+        self.assertIn(("value",), other_row_cache)
+
+    def testRowCacheIsolatedPerQuery(self):
+        """Tests that rows of different queries are cached separately."""
+        cache = sqlite.SQLiteCache()
+
+        row_cache = cache.GetRowCache("SELECT 1")
+        other_row_cache = cache.GetRowCache("SELECT 2")
+
+        self.assertIsNot(row_cache, other_row_cache)
+        row_cache.add(("value",))
+        self.assertNotIn(("value",), other_row_cache)
+
+
 class SQLiteParserTest(test_lib.ParserTestCase):
     """Tests for the SQLite database parser."""
 
@@ -282,6 +322,83 @@ class SQLiteParserTest(test_lib.ParserTestCase):
             "event_data"
         )
         self.assertEqual(number_of_event_data, 0)
+
+        number_of_warnings = storage_writer.GetNumberOfAttributeContainers(
+            "extraction_warning"
+        )
+        self.assertEqual(number_of_warnings, 0)
+
+        number_of_warnings = storage_writer.GetNumberOfAttributeContainers(
+            "recovery_warning"
+        )
+        self.assertEqual(number_of_warnings, 0)
+
+    def testParseFileEntryOnDatabaseWithWAL(self):
+        """Tests ParseFileEntry on a database with a WAL file.
+
+        The database is parsed twice: once ignoring the WAL file and once with
+        the WAL file committed. Rows whose field values are identical must only
+        be emitted once, while rows that were rewritten or deleted through the
+        WAL must retain their pre-WAL values and rows added through the WAL
+        must be emitted with their resolved URL and title.
+        """
+        parser = sqlite.SQLiteParser()
+        storage_writer = self._ParseFile(["chrome", "History-wal"], parser)
+
+        event_data = list(storage_writer.GetAttributeContainers("event_data"))
+
+        page_visited = [
+            event
+            for event in event_data
+            if event.data_type == "chrome:history:page_visited"
+        ]
+        file_downloaded = [
+            event
+            for event in event_data
+            if event.data_type == "chrome:history:file_downloaded"
+        ]
+
+        # Three rows are read without the WAL, the unchanged row and the
+        # unchanged download are deduplicated in the WAL pass and the rewritten
+        # row plus the WAL-only row are added.
+        self.assertEqual(len(page_visited), 5)
+        self.assertEqual(len(file_downloaded), 1)
+
+        page_visited_by_url = {event.url: event for event in page_visited}
+
+        # The pre-WAL version of the rewritten row is retained.
+        rewritten_url = (
+            "https://raw.githubusercontent.com/dfirlabs/chrome-specimens/"
+            "master/generate-specimens.sh"
+        )
+        rewritten_events = [
+            event for event in page_visited if event.url == rewritten_url
+        ]
+        self.assertEqual(
+            sorted(event.title for event in rewritten_events),
+            ["", "Modified Title"],
+        )
+
+        # A row deleted through the WAL remains visible from the database file.
+        self.assertIn("https://example.com/committed-two", page_visited_by_url)
+
+        # The unchanged row is emitted only once.
+        unchanged_events = [
+            event
+            for event in page_visited
+            if event.url == "https://example.com/committed-three"
+        ]
+        self.assertEqual(len(unchanged_events), 1)
+
+        # The WAL-only row is emitted with its URL, title and resolved
+        # from_visit reference.
+        wal_only_event = page_visited_by_url.get("https://example.com/wal-new")
+        self.assertIsNotNone(wal_only_event)
+        self.assertEqual(wal_only_event.title, "WAL New Title")
+        self.assertEqual(
+            wal_only_event.from_visit,
+            f"{rewritten_url:s} (Modified Title)",
+        )
 
         number_of_warnings = storage_writer.GetNumberOfAttributeContainers(
             "extraction_warning"

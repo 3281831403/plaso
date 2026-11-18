@@ -203,29 +203,22 @@ class SQLitePlugin(plugins.BasePlugin):
         return row[value_index]
 
     @classmethod
-    def _HashRow(cls, row):
-        """Hashes the given row.
+    def _GetRowValues(cls, row):
+        """Retrieves the values of the given row.
+
+        The values are returned as a tuple so they can be used to detect rows
+        that contain identical field values. Unlike a hash of a string
+        representation of the row, tuples distinguish values that hash to the
+        same value, such as different values whose string representations are
+        ambiguous when joined.
 
         Args:
           row (sqlite3.Row): row.
 
         Returns:
-          int: hash value of the given row.
+          tuple: values of the given row.
         """
-        values = []
-        for value in row:
-            try:
-                value = f"{value!s}"
-            except UnicodeDecodeError:
-                # In Python 2, blobs are "read-write buffer" and will cause a
-                # UnicodeDecodeError exception if we try format it as a string.
-                # Since Python 3 does not support the buffer type we cannot check
-                # the type of value.
-                value = repr(value)
-
-            values.append(value)
-
-        return hash(" ".join(values))
+        return tuple(row)
 
     def _ParseSQLiteDatabase(self, parser_mediator, database, query, callback, cache):
         """Extracts events from a SQLite database.
@@ -254,8 +247,8 @@ class SQLitePlugin(plugins.BasePlugin):
             if parser_mediator.abort:
                 break
 
-            row_hash = self._HashRow(row)
-            if row_hash in row_cache:
+            row_values = self._GetRowValues(row)
+            if row_values in row_cache:
                 continue
 
             try:
@@ -269,7 +262,7 @@ class SQLitePlugin(plugins.BasePlugin):
                 # TODO: consider removing return.
                 return
 
-            row_cache.add(row_hash)
+            row_cache.add(row_values)
 
     def CheckRequiredTablesAndColumns(self, database):
         """Check if the database has the minimal structure required by the plugin.

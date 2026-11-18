@@ -17,10 +17,21 @@ from plaso.parsers import plugins
 class SQLiteCache(plugins.BasePluginCache):
     """Cache for storing results of SQL queries."""
 
-    def __init__(self):
-        """Initializes a SQLite cache."""
+    def __init__(self, row_caches=None):
+        """Initializes a SQLite cache.
+
+        Args:
+          row_caches (Optional[dict[str, set[tuple]]]): per-query caches that
+              contain the values of the rows that have been parsed. A single
+              instance is shared between the parse pass over the database file
+              and the parse pass over the database with its Write-Ahead Log
+              (WAL) committed, so rows that were already emitted are not
+              emitted a second time. If None a new instance is created.
+        """
         super().__init__()
-        self._row_caches = {}
+        # Note that an empty dictionary is a valid shared instance, so check for
+        # None explicitly instead of relying on the truthiness of row_caches.
+        self._row_caches = row_caches if row_caches is not None else {}
 
     def CacheQueryResults(self, sql_results, attribute_name, key_name, column_names):
         """Build a dictionary object based on a SQL command.
@@ -86,20 +97,20 @@ class SQLiteCache(plugins.BasePluginCache):
     def GetRowCache(self, query):
         """Retrieves the row cache for a specific query.
 
-        The row cache is a set that contains hashes of values in a row. The row
-        cache is used to find duplicate row when a database and a database with
-        a WAL file is parsed.
+        The row cache contains the values of the rows that have been parsed and
+        is used to find duplicate rows when a database and the same database
+        with a Write-Ahead Log (WAL) file are parsed. The cache is keyed on the
+        query text so rows produced by different queries are never merged.
 
         Args:
           query (str): query.
 
         Returns:
-          set: hashes of the rows that have been parsed.
+          set[tuple]: values of the rows that have been parsed.
         """
-        query_hash = hash(query)
-        if query_hash not in self._row_caches:
-            self._row_caches[query_hash] = set()
-        return self._row_caches[query_hash]
+        if query not in self._row_caches:
+            self._row_caches[query] = set()
+        return self._row_caches[query]
 
 
 class SQLiteDatabase:
@@ -445,8 +456,14 @@ class SQLiteParser(interface.FileEntryParser):
             )
             return
 
-        # Create a cache in which the resulting tables are cached.
-        cache = SQLiteCache()
+        # Create a cache in which the resulting tables are cached. The row
+        # caches are shared with the parse pass over the database with its WAL
+        # committed, so rows that were already emitted from this pass are not
+        # emitted a second time. The other caches remain per-pass, since they
+        # hold query results such as URL lookups that can differ between the
+        # database file and the database with WAL committed.
+        row_caches = {}
+        cache = SQLiteCache(row_caches=row_caches)
 
         display_name = parser_mediator.GetDisplayName(file_entry=file_entry)
 
@@ -473,8 +490,10 @@ class SQLiteParser(interface.FileEntryParser):
 
         parser_mediator.ProduceEventDataStream(event_data_stream)
 
-        # Create a cache in which the resulting tables are cached.
-        cache = SQLiteCache()
+        # Reuse the row caches of the first pass for cross-pass deduplication,
+        # while keeping the other caches, such as the URL lookup results,
+        # specific to this pass.
+        cache = SQLiteCache(row_caches=row_caches)
 
         display_name = parser_mediator.GetDisplayName(file_entry=wal_file_entry)
 

@@ -3,6 +3,7 @@
 
 import unittest
 
+from plaso.parsers import sqlite as sqlite_parser
 from plaso.parsers.sqlite_plugins import interface
 
 from tests.parsers.sqlite_plugins import test_lib
@@ -95,6 +96,70 @@ class SQLiteInterfaceTest(test_lib.SQLitePluginTestCase):
         ]
 
         self.assertEqual(plugin.results, expected_results)
+
+    def testProcessDeduplicatesRowsAcrossSharedCache(self):
+        """Tests cross-pass deduplication with a shared row cache.
+
+        Simulates the two passes of the SQLite parser: the same row values must
+        be emitted only once, while rows whose values differ must both be kept.
+        """
+        row_caches = {}
+
+        first_plugin = TestSQLitePlugin()
+        first_cache = sqlite_parser.SQLiteCache(row_caches=row_caches)
+        self._ParseDatabaseFileWithPlugin(
+            ["wal_database.db"], first_plugin, cache=first_cache
+        )
+
+        second_plugin = TestSQLitePlugin()
+        second_cache = sqlite_parser.SQLiteCache(row_caches=row_caches)
+        self._ParseDatabaseFileWithPlugin(
+            ["wal_database.db"],
+            second_plugin,
+            wal_path_segments=["wal_database.db-wal"],
+            cache=second_cache,
+        )
+
+        combined_results = first_plugin.results + second_plugin.results
+
+        # Rows identical between the two passes are emitted only once.
+        identical_row = ("Committed Text 4", 5, None)
+        self.assertEqual(combined_results.count(identical_row), 1)
+
+        # The pre-WAL value and the WAL-rewritten value of the same record are
+        # both retained, because their field values differ.
+        self.assertIn(("Committed Text 3", 4, None), combined_results)
+        self.assertIn(("Modified Committed Text 3", 4, None), combined_results)
+
+        # A row only present in the WAL pass is emitted.
+        self.assertIn(("New Text 1", 12, None), combined_results)
+
+        # A row only present in the database-only pass is retained.
+        self.assertIn(("Deleted Text 1", 3, None), combined_results)
+
+    def testGetRowValuesDistinguishesAmbiguousStringRows(self):
+        """Tests that exact row values, not string joins, drive deduplication.
+
+        Rows whose values would produce an ambiguous joined string must not be
+        treated as duplicates.
+        """
+        plugin = TestSQLitePlugin()
+
+        class FakeRow:
+            """Minimal sqlite3.Row-like sequence."""
+
+            def __init__(self, values):
+                self._values = values
+
+            def __iter__(self):
+                return iter(self._values)
+
+        ambiguous_rows = [
+            FakeRow(("a b", "c")),
+            FakeRow(("a", "b c")),
+        ]
+        row_signatures = {plugin._GetRowValues(row) for row in ambiguous_rows}
+        self.assertEqual(len(row_signatures), 2)
 
     def testCheckSchema(self):
         """Tests the CheckSchema function."""
